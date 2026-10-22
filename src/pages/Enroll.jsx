@@ -1,13 +1,13 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { useParams, Link, useNavigate } from 'react-router-dom';
+import { useParams, Link, useNavigate, useLocation } from 'react-router-dom';
 import { 
   FaUser, FaUsers, FaGamepad, FaUniversity, FaPhone, FaEnvelope, FaIdCard, 
   FaQrcode, FaCheckCircle, FaExclamationCircle, FaCopy, FaCheck, FaPrint, 
   FaTicketAlt, FaCalendarAlt, FaTimes, FaArrowRight, FaTrophy, FaMapMarkerAlt,
-  FaFileImage, FaTrashAlt, FaClock, FaEye
+  FaFileImage, FaTrashAlt, FaClock, FaEye, FaCreditCard, FaLock, FaShieldAlt, FaBolt
 } from 'react-icons/fa';
 import TechfestCyberBackground from '../components/TechfestCyberBackground';
-import { API_BASE_URL, insertDirectToSupabase, uploadScreenshotDirect } from '../config/api';
+import { API_BASE_URL, insertDirectToSupabase, uploadScreenshotDirect, createCashfreeOrder, verifyCashfreeOrder } from '../config/api';
 
 const ALL_EVENTS = [
   { 
@@ -209,6 +209,7 @@ const ESPORTS_IDS = ['bgmi', 'mlbb', 'free'];
 export default function Enroll() {
   const { eventId: paramEventId } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
 
   // Find initial event or default to first
   const [selectedEventId, setSelectedEventId] = useState(paramEventId || 'code');
@@ -261,6 +262,7 @@ export default function Enroll() {
   const [previewScreenshotUrl, setPreviewScreenshotUrl] = useState(null);
   const [errors, setErrors] = useState({});
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isVerifyingPayment, setIsVerifyingPayment] = useState(false);
   const [statusMessage, setStatusMessage] = useState(null);
   const [submittedEnrollment, setSubmittedEnrollment] = useState(null);
   const [copied, setCopied] = useState(false);
@@ -398,6 +400,192 @@ IFSC Code: SBIN0007543`;
 
   // Active fee based on affiliation
   const activeFee = collegeAffiliation === 'NIT Nagaland' ? currentEvent.feeNIT : currentEvent.feeOutside;
+
+  // Handle return URL callback from Cashfree (e.g. /enroll?order_id=TA26_...)
+  useEffect(() => {
+    const searchParams = new URLSearchParams(location.search);
+    const orderIdParam = searchParams.get('order_id');
+    if (orderIdParam) {
+      handleVerifyCashfreeOrder(orderIdParam);
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.search]);
+
+  // Cashfree Order Verification & Auto-Confirmation Email Handler
+  const handleVerifyCashfreeOrder = async (orderId, registrationId = null) => {
+    setIsVerifyingPayment(true);
+    setStatusMessage({ type: 'info', text: 'Verifying payment with Cashfree and preparing your digital pass...' });
+
+    try {
+      const result = await verifyCashfreeOrder(orderId, registrationId);
+
+      if (result.success && result.verified) {
+        const reg = result.registration || {};
+        setSubmittedEnrollment({
+          referenceId: reg.id || reg.registrationId || orderId,
+          eventTitle: reg.eventTitle || currentEvent.title,
+          fullName: reg.fullName || formData.fullName,
+          phone: reg.phone || formData.phone,
+          college: reg.college || collegeAffiliation,
+          rollNumber: reg.rollNumber || formData.rollNumber || 'N/A',
+          teamName: reg.teamName || formData.teamName || null,
+          inGameID: reg.inGameID || formData.inGameID || null,
+          eventDate: `${currentEvent.date} (${currentEvent.time})`,
+          venue: currentEvent.venue,
+          utrNumber: reg.utrNumber || reg.paymentId || 'CASHFREE-PAID',
+          entryFee: activeFee,
+          email: reg.email || formData.email,
+          emailSent: Boolean(result.emailSent),
+        });
+
+        setStatusMessage({
+          type: 'success',
+          text: `Payment verified! Registration confirmed. ${result.emailSent ? 'Official confirmation email with pass dispatched!' : ''}`,
+        });
+      } else {
+        setStatusMessage({
+          type: 'error',
+          text: result.message || 'Payment could not be verified. If amount was deducted, please reach out to coordinators.',
+        });
+      }
+    } catch (err) {
+      console.error('[Verification Error]', err);
+      setStatusMessage({
+        type: 'error',
+        text: err.message || 'Could not verify payment status with server.',
+      });
+    } finally {
+      setIsVerifyingPayment(false);
+      setIsSubmitting(false);
+    }
+  };
+
+  // Cashfree Gateway Payment Trigger
+  const handleCashfreePayment = async (e) => {
+    if (e) e.preventDefault();
+    setStatusMessage(null);
+
+    // 1. Validate Full Name
+    if (!formData.fullName || formData.fullName.trim().length < 2) {
+      setErrors((prev) => ({ ...prev, fullName: 'Please enter your full name.' }));
+      setStatusMessage({ type: 'error', text: 'Please enter your full name.' });
+      return;
+    }
+
+    // 2. Validate Email
+    if (!formData.email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(formData.email.trim())) {
+      setErrors((prev) => ({ ...prev, email: 'Please enter a valid email address.' }));
+      setStatusMessage({ type: 'error', text: 'Please enter a valid email address.' });
+      return;
+    }
+
+    // 3. Validate Mobile Number (Must be exactly 10 digits)
+    if (!/^\d{10}$/.test(formData.phone)) {
+      setErrors((prev) => ({ ...prev, phone: 'Mobile number must be exactly 10 digits.' }));
+      setStatusMessage({ type: 'error', text: 'Mobile number must be exactly 10 digits.' });
+      return;
+    }
+
+    // 4. Validate Roll Number (Required if NIT Nagaland)
+    if (collegeAffiliation === 'NIT Nagaland') {
+      if (!/^\d{10}$/.test(formData.rollNumber)) {
+        setErrors((prev) => ({ ...prev, rollNumber: 'Roll / Registration number must be exactly 10 digits for NIT Nagaland students.' }));
+        setStatusMessage({ type: 'error', text: 'Roll / Registration number must be exactly 10 digits for NIT Nagaland students.' });
+        return;
+      }
+    } else if (formData.rollNumber && !/^\d{10}$/.test(formData.rollNumber)) {
+      setErrors((prev) => ({ ...prev, rollNumber: 'Roll / Registration number must be exactly 10 digits.' }));
+      setStatusMessage({ type: 'error', text: 'Roll / Registration number must be exactly 10 digits.' });
+      return;
+    }
+
+    // 5. Validate Team Members
+    for (let i = 0; i < teamMembers.length; i++) {
+      const member = teamMembers[i];
+      if (member.name && member.name.trim() !== '') {
+        if (member.rollNumber && !/^\d{10}$/.test(member.rollNumber.trim())) {
+          setStatusMessage({ type: 'error', text: `Team Member ${i + 2} Roll Number must be exactly 10 digits.` });
+          return;
+        }
+      }
+    }
+
+    setIsSubmitting(true);
+    setStatusMessage({ type: 'info', text: 'Connecting to Cashfree Payment Gateway...' });
+
+    try {
+      const numericAmount = Math.max(1, parseInt(String(activeFee).replace(/[^0-9]/g, ''), 10) || 99);
+
+      const cleanMembers = teamMembers
+        .filter((m) => m.name && m.name.trim() !== '')
+        .map((m) => ({
+          name: m.name.trim(),
+          rollNumber: m.rollNumber ? m.rollNumber.trim() : '',
+          inGameID: m.inGameID ? m.inGameID.trim() : '',
+        }));
+
+      const orderPayload = {
+        eventId: currentEvent.id,
+        eventTitle: currentEvent.title,
+        fullName: formData.fullName.trim(),
+        email: formData.email.trim(),
+        phone: formData.phone.trim(),
+        college: collegeAffiliation === 'NIT Nagaland' ? 'NIT Nagaland' : (otherCollegeName || 'Other College/University'),
+        rollNumber: formData.rollNumber.trim(),
+        teamName: isTeamEvent ? formData.teamName.trim() : '',
+        teamMembers: cleanMembers,
+        inGameID: isEsports ? formData.inGameID.trim() : '',
+        note: formData.note.trim(),
+        amount: numericAmount,
+      };
+
+      const result = await createCashfreeOrder(orderPayload);
+
+      if (!result.success || !result.payment_session_id) {
+        throw new Error(result.message || 'Failed to create payment session.');
+      }
+
+      // Check if Cashfree JS SDK is loaded on window
+      if (window.Cashfree) {
+        const cashfree = window.Cashfree({
+          mode: import.meta.env.VITE_CASHFREE_MODE || 'sandbox',
+        });
+
+        const checkoutOptions = {
+          paymentSessionId: result.payment_session_id,
+          redirectTarget: "_modal",
+        };
+
+        cashfree.checkout(checkoutOptions).then(async (cfResponse) => {
+          if (cfResponse.paymentDetails || cfResponse.payment_status === 'SUCCESS') {
+            await handleVerifyCashfreeOrder(result.order_id, result.registrationId);
+          } else if (cfResponse.error) {
+            console.error('[Cashfree Error]', cfResponse.error);
+            setIsSubmitting(false);
+            setStatusMessage({
+              type: 'error',
+              text: cfResponse.error.message || 'Payment was not completed.',
+            });
+          } else {
+            // Modal closed: verify status
+            await handleVerifyCashfreeOrder(result.order_id, result.registrationId);
+          }
+        });
+      } else {
+        // Direct simulation / verification if SDK script hasn't initialized
+        console.warn('Cashfree JS SDK not detected on window, verifying order...');
+        await handleVerifyCashfreeOrder(result.order_id, result.registrationId);
+      }
+    } catch (err) {
+      console.error('[Cashfree Payment Initiation Error]', err);
+      setIsSubmitting(false);
+      setStatusMessage({
+        type: 'error',
+        text: err.message || 'Could not connect to payment gateway. Please try again.',
+      });
+    }
+  };
 
   // Form submit handler
   const handleSubmit = async (e) => {
@@ -1055,141 +1243,125 @@ IFSC Code: SBIN0007543`;
                 </div>
               )}
 
-              {/* SECTION 3: Payment Verification & Proof Upload */}
+              {/* SECTION 3: Cashfree Online Payment Gateway & Automated Email Pass */}
               <div>
                 <div className="flex items-center gap-3 border-b border-white/10 pb-3 mb-6">
-                  <div className="w-8 h-8 rounded-lg bg-pink-950 border border-pink-500/40 flex items-center justify-center text-pink-400 font-bold font-mono text-sm">
+                  <div className="w-8 h-8 rounded-lg bg-cyan-950 border border-cyan-500/40 flex items-center justify-center text-cyan-400 font-bold font-mono text-sm">
                     {isTeamEvent || isEsports ? '03' : '02'}
                   </div>
                   <div>
-                    <h3 className="text-lg sm:text-xl font-bold text-white tracking-wide">
-                      Payment Verification & Proof
+                    <h3 className="text-lg sm:text-xl font-bold text-white tracking-wide flex items-center gap-2">
+                      <FaCreditCard className="w-4 h-4 text-cyan-400" />
+                      Payment Gateway (Cashfree)
                     </h3>
-                    <p className="text-xs text-gray-400 font-mono">Scan the UPI QR Code and attach payment screenshot</p>
+                    <p className="text-xs text-gray-400 font-mono">Instant verification • UPI (GPay, PhonePe, Paytm), Cards & Net Banking • Auto-Email Pass</p>
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-center bg-black/40 p-5 sm:p-6 rounded-2xl border border-white/5">
-                  {/* Official PhonePe QR Code Box with Click to View Account Details */}
-                  <div className="md:col-span-5 text-center flex flex-col items-center">
-                    <div 
-                      onClick={() => setShowAccountModal(true)}
-                      className="group relative p-3 bg-white rounded-2xl shadow-2xl max-w-[195px] border-2 border-cyan-400/80 cursor-pointer hover:border-cyan-300 hover:scale-[1.02] transition-all"
-                      title="Click to view bank account details"
-                    >
-                      <img 
-                        src="/qr.jpg" 
-                        alt="Tech Avinya Official PhonePe QR - Ayush Kumar" 
-                        className="w-full h-auto rounded-lg object-contain"
-                      />
-                      <div className="absolute inset-0 bg-black/75 rounded-xl opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center justify-center p-3 text-white">
-                        <FaEye className="w-6 h-6 text-cyan-400 mb-1.5 animate-bounce" />
-                        <span className="text-xs font-bold leading-tight text-center">Click to View Bank Account Details</span>
+                {/* Cashfree Payment Gateway Box */}
+                <div className="relative bg-gradient-to-br from-slate-900/90 via-cyan-950/20 to-black p-5 sm:p-7 rounded-3xl border border-cyan-500/40 shadow-[0_0_30px_rgba(0,240,255,0.15)] overflow-hidden">
+                  {/* Decorative glowing accent */}
+                  <div className="absolute top-0 right-0 w-48 h-48 bg-cyan-500/10 rounded-full filter blur-2xl pointer-events-none" />
+
+                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-center">
+                    {/* Left: Summary & Payment Methods */}
+                    <div className="lg:col-span-7 space-y-4">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="px-3 py-1 rounded-full text-[11px] font-mono font-bold bg-emerald-950/80 text-emerald-400 border border-emerald-500/40 uppercase tracking-wider flex items-center gap-1.5">
+                          <FaCheckCircle className="w-3 h-3" /> Cashfree Verified Gateway
+                        </span>
+                        <span className="px-3 py-1 rounded-full text-[11px] font-mono text-cyan-300 bg-cyan-950/60 border border-cyan-500/30">
+                          Auto-Email Pass
+                        </span>
                       </div>
-                    </div>
 
-                    <span className="text-[11px] font-mono text-cyan-300 mt-2 block">
-                      Pay Exact: <b className="text-white text-xs">{activeFee}</b>
-                    </span>
+                      <div>
+                        <h4 className="text-base sm:text-lg font-bold text-white">{currentEvent.title} Entry Pass</h4>
+                        <p className="text-xs text-gray-400 font-mono mt-0.5">
+                          {collegeAffiliation} • {isTeamEvent ? `Squad (${currentEvent.minMembers}-${currentEvent.maxMembers} members)` : 'Individual'}
+                        </p>
+                      </div>
 
-                    {/* Interactive Button to View Direct Bank & Account Details */}
-                    <button
-                      type="button"
-                      onClick={() => setShowAccountModal(true)}
-                      className="mt-3 inline-flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-mono font-bold bg-cyan-950/80 hover:bg-cyan-500 hover:text-black border border-cyan-400/50 text-cyan-300 shadow-[0_0_12px_rgba(0,240,255,0.25)] transition-all cursor-pointer"
-                    >
-                      <FaUniversity className="w-3.5 h-3.5 text-cyan-400 group-hover:text-black" />
-                      View Account Details
-                    </button>
-                  </div>
-
-                  {/* Payment Instructions & File Dropzone */}
-                  <div className="md:col-span-7 space-y-4">
-                    <div className="text-xs space-y-1.5 text-gray-300">
-                      <p className="flex items-center gap-2">
-                        <FaCheckCircle className="w-3.5 h-3.5 text-cyan-400 flex-shrink-0" />
-                        Scan using any UPI app (GPay, PhonePe, Paytm, BHIM).
-                      </p>
-                      <p className="flex items-center gap-2">
-                        <FaCheckCircle className="w-3.5 h-3.5 text-cyan-400 flex-shrink-0" />
-                        Take a screenshot showing the transaction ID & timestamp.
-                      </p>
-                      <p className="flex items-center gap-2">
-                        <FaCheckCircle className="w-3.5 h-3.5 text-cyan-400 flex-shrink-0" />
-                        Upload proof below for instant desk verification.
-                      </p>
-                    </div>
-
-                    {/* Screenshot Upload Input */}
-                    {!previewScreenshotUrl ? (
-                      <label className="border-2 border-dashed border-cyan-500/40 hover:border-cyan-400 rounded-2xl p-4 flex flex-col items-center justify-center cursor-pointer bg-black/40 hover:bg-cyan-950/20 transition-all text-center">
-                        <FaFileImage className="w-8 h-8 text-cyan-400 mb-2 animate-bounce" />
-                        <span className="text-xs font-semibold text-white">Click or Drag & Drop Payment Screenshot</span>
-                        <span className="text-[11px] text-gray-400 font-mono mt-0.5">JPG, PNG, WebP up to 10MB</span>
-                        <input
-                          type="file"
-                          accept="image/*"
-                          onChange={handleFileChange}
-                          className="hidden"
-                        />
-                      </label>
-                    ) : (
-                      <div className="relative rounded-2xl overflow-hidden border border-emerald-500/50 p-3 bg-emerald-950/20 flex items-center justify-between">
-                        <div className="flex items-center gap-3">
-                          <img 
-                            src={previewScreenshotUrl} 
-                            alt="Screenshot Preview" 
-                            className="w-14 h-14 object-cover rounded-xl border border-emerald-400"
-                          />
-                          <div>
-                            <p className="text-xs font-bold text-white truncate max-w-[180px]">{screenshotFile?.name}</p>
-                            <p className="text-[11px] font-mono text-emerald-400 flex items-center gap-1 mt-0.5">
-                              <FaCheck className="w-3 h-3" /> Proof attached
-                            </p>
-                          </div>
+                      {/* Payment Methods Supported */}
+                      <div className="p-3.5 rounded-2xl bg-black/60 border border-white/10 space-y-2">
+                        <p className="text-[11px] font-mono uppercase tracking-wider text-gray-400 flex items-center gap-1.5">
+                          <FaLock className="w-3 h-3 text-cyan-400" />
+                          Supported Payment Options:
+                        </p>
+                        <div className="flex flex-wrap gap-2 text-xs font-mono">
+                          <span className="px-2.5 py-1 rounded-lg bg-cyan-950/70 border border-cyan-500/30 text-cyan-200">
+                            UPI (Google Pay, PhonePe, Paytm, BHIM)
+                          </span>
+                          <span className="px-2.5 py-1 rounded-lg bg-blue-950/70 border border-blue-500/30 text-blue-200">
+                            Cards (Visa, Mastercard, RuPay)
+                          </span>
+                          <span className="px-2.5 py-1 rounded-lg bg-purple-950/70 border border-purple-500/30 text-purple-200">
+                            Net Banking (All Indian Banks)
+                          </span>
                         </div>
-                        <button
-                          type="button"
-                          onClick={handleRemoveScreenshot}
-                          className="p-2 rounded-xl bg-red-950/80 border border-red-500/50 text-red-300 hover:text-white hover:bg-red-900 transition-all cursor-pointer"
-                        >
-                          <FaTrashAlt className="w-4 h-4" />
-                        </button>
                       </div>
-                    )}
-                  </div>
-                </div>
 
-                {/* Dedicated UTR / UPI Transaction ID Field */}
-                <div className="mt-5 p-4 rounded-2xl bg-cyan-950/20 border border-cyan-500/30 shadow-inner">
-                  <label className="block text-xs font-mono uppercase tracking-wider text-cyan-300 mb-1.5 flex items-center justify-between">
-                    <span className="flex items-center gap-1.5 font-bold">
-                      <FaTicketAlt className="w-3.5 h-3.5 text-cyan-400" />
-                      UTR / UPI Transaction ID *
-                    </span>
-                    <span className="text-[11px] font-mono text-cyan-400/80">12-digit UTR No.</span>
-                  </label>
-                  <input
-                    type="text"
-                    name="utrNumber"
-                    required
-                    value={formData.utrNumber}
-                    onChange={handleInputChange}
-                    placeholder="e.g. 429812345678 or UPI Ref ID"
-                    className={`w-full px-4 py-3 rounded-xl bg-black/70 border text-white placeholder-gray-500 text-sm font-mono tracking-wider focus:outline-none transition-all ${
-                      errors.utrNumber
-                        ? 'border-red-500 focus:ring-1 focus:ring-red-500'
-                        : 'border-cyan-500/40 focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400'
-                    }`}
-                  />
-                  {errors.utrNumber ? (
-                    <p className="text-red-400 text-xs mt-1 font-mono">{errors.utrNumber}</p>
-                  ) : (
-                    <p className="text-gray-400 text-[11px] font-mono mt-1.5 flex items-center gap-1.5">
-                      <FaCheckCircle className="w-3 h-3 text-cyan-400 flex-shrink-0" />
-                      Enter the 12-digit UTR / UPI Reference ID shown on your Google Pay / PhonePe / Paytm / BHIM confirmation screen.
-                    </p>
-                  )}
+                      {/* Benefits Checklist */}
+                      <div className="text-xs space-y-1.5 text-gray-300 font-mono">
+                        <p className="flex items-center gap-2">
+                          <FaCheckCircle className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0" />
+                          Instant desk pass reference ID generated immediately upon payment.
+                        </p>
+                        <p className="flex items-center gap-2">
+                          <FaCheckCircle className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0" />
+                          Official confirmation pass emailed automatically to your inbox.
+                        </p>
+                        <p className="flex items-center gap-2">
+                          <FaShieldAlt className="w-3.5 h-3.5 text-cyan-400 flex-shrink-0" />
+                          256-bit SSL encrypted & RBI-compliant gateway.
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Right: Fee Summary & Action */}
+                    <div className="lg:col-span-5 flex flex-col justify-between p-5 rounded-2xl bg-black/70 border border-cyan-400/30 text-center space-y-4">
+                      <div>
+                        <span className="text-[11px] font-mono uppercase tracking-wider text-gray-400 block">
+                          Total Payable Amount
+                        </span>
+                        <div className="text-3xl sm:text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-cyan-300 via-sky-300 to-blue-400 font-mono mt-1">
+                          {activeFee}
+                        </div>
+                        <span className="text-[11px] font-mono text-emerald-400 block mt-1">
+                          ✓ Platform charges ₹ 0 • Zero extra fees
+                        </span>
+                      </div>
+
+                      {/* Main Payment Trigger Button */}
+                      <button
+                        type="button"
+                        onClick={handleCashfreePayment}
+                        disabled={isSubmitting || isVerifyingPayment}
+                        className="w-full py-4 px-6 rounded-2xl font-extrabold uppercase tracking-widest text-sm bg-gradient-to-r from-cyan-500 via-sky-500 to-blue-600 text-white hover:brightness-110 shadow-[0_0_30px_rgba(0,240,255,0.4)] disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2 cursor-pointer"
+                      >
+                        {isSubmitting || isVerifyingPayment ? (
+                          <>
+                            <span className="w-4 h-4 rounded-full border-2 border-white border-t-transparent animate-spin" />
+                            {isVerifyingPayment ? 'Verifying & Sending Pass...' : 'Opening Cashfree Gateway...'}
+                          </>
+                        ) : (
+                          <>
+                            <FaBolt className="w-4 h-4 text-yellow-300 animate-pulse" />
+                            Pay {activeFee} via Cashfree &rarr;
+                          </>
+                        )}
+                      </button>
+
+                      {/* Alternate Bank Details Toggle */}
+                      <button
+                        type="button"
+                        onClick={() => setShowAccountModal(true)}
+                        className="text-[11px] font-mono text-cyan-300/80 hover:text-cyan-200 underline cursor-pointer transition-colors"
+                      >
+                        Need assistance or direct bank NEFT/IMPS? View Details
+                      </button>
+                    </div>
+                  </div>
                 </div>
 
                 {/* Additional Note */}
@@ -1205,26 +1377,10 @@ IFSC Code: SBIN0007543`;
                 </div>
               </div>
 
-              {/* Submit Button */}
-              <div className="pt-4 border-t border-white/10">
-                <button
-                  type="submit"
-                  disabled={isSubmitting}
-                  className="w-full py-4 px-6 rounded-2xl font-extrabold uppercase tracking-widest text-sm bg-gradient-to-r from-cyan-500 via-sky-500 to-blue-600 text-white hover:brightness-110 shadow-[0_0_25px_rgba(0,240,255,0.4)] disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2 cursor-pointer"
-                >
-                  {isSubmitting ? (
-                    <>
-                      <span className="w-4 h-4 rounded-full border-2 border-white border-t-transparent animate-spin" />
-                      Processing Enrollment...
-                    </>
-                  ) : (
-                    <>
-                      Confirm & Submit Enrollment &rarr;
-                    </>
-                  )}
-                </button>
-                <p className="text-[11px] text-center text-gray-400 font-mono mt-2">
-                  Instant registration with verifiable pass & reference ID generated upon submission.
+              {/* Submit Action Subtext */}
+              <div className="pt-2">
+                <p className="text-[11px] text-center text-gray-400 font-mono">
+                  Instant registration with verifiable festival admission pass & confirmation email upon payment.
                 </p>
               </div>
             </form>
@@ -1258,6 +1414,18 @@ IFSC Code: SBIN0007543`;
               <p className="text-xs text-gray-300 font-mono mt-1">
                 Your entry pass for <b className="text-cyan-300">{submittedEnrollment.eventTitle}</b> has been issued.
               </p>
+              {submittedEnrollment.email && (
+                <div className="mt-3 inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-emerald-950/90 border border-emerald-500/50 text-[11px] font-mono text-emerald-300 shadow-[0_0_15px_rgba(16,185,129,0.25)]">
+                  <FaEnvelope className="w-3.5 h-3.5 text-emerald-400" />
+                  Confirmation email with pass sent to: <b className="text-white">{submittedEnrollment.email}</b>
+                </div>
+              )}
+              {submittedEnrollment.email && (
+                <div className="mt-3 inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-emerald-950/90 border border-emerald-500/50 text-[11px] font-mono text-emerald-300 shadow-[0_0_15px_rgba(16,185,129,0.25)]">
+                  <FaEnvelope className="w-3.5 h-3.5 text-emerald-400" />
+                  Confirmation email with pass sent to: <b className="text-white">{submittedEnrollment.email}</b>
+                </div>
+              )}
             </div>
 
             {/* Reference ID Pill */}

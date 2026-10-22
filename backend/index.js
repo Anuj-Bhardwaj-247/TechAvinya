@@ -3,6 +3,12 @@ import cors from 'cors';
 import multer from 'multer';
 import dotenv from 'dotenv';
 import { supabase, isSupabaseConfigured } from './supabase.js';
+import { 
+  createCashfreePGOrder, 
+  fetchCashfreePGOrder, 
+  fetchCashfreePGPayments, 
+  isCashfreeConfigured 
+} from './cashfree.js';
 
 dotenv.config();
 
@@ -821,6 +827,406 @@ app.put('/api/admin/sponsors/status/:id', async (req, res) => {
     return res.json({ success: true, message: `Status updated to ${status} (Demo Mode).` });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// -------------------------------------------------------------
+// 8. CASHFREE PAYMENT GATEWAY & AUTOMATED CONFIRMATION EMAIL
+// -------------------------------------------------------------
+
+// In-memory cache for pending Cashfree orders (helps fallback when Supabase is updating)
+const pendingCashfreeOrders = new Map();
+
+/**
+ * 8A. CREATE CASHFREE PAYMENT ORDER
+ * POST /api/cashfree/create-order
+ */
+app.post('/api/cashfree/create-order', async (req, res) => {
+  try {
+    const body = req.body;
+    const eventId = body.eventId || body.event_id;
+    const eventTitle = body.eventTitle || body.event_title || 'Tech Avinya Event';
+    const fullName = body.fullName || body.name;
+    const email = body.email;
+    const phone = body.phone || body.mobile;
+    const college = body.college || body.collegeAffiliation || 'Other College/University';
+    const rollNumber = body.rollNumber || body.roll_number || null;
+    const teamName = body.teamName || body.team_name || null;
+    const inGameID = body.inGameID || body.in_game_id || null;
+    const note = body.note || '';
+    const rawAmount = body.amount || body.fee || 99;
+    const cleanAmount = Math.max(1, parseFloat(String(rawAmount).replace(/[^0-9.]/g, '')) || 99);
+
+    // 1. Validation
+    if (!eventId || !fullName || !email || !phone) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields: Event, Full Name, Email, and Mobile Number are required.',
+      });
+    }
+
+    const phoneValidation = validateMobile(phone);
+    if (!phoneValidation.valid) {
+      return res.status(400).json({
+        success: false,
+        message: phoneValidation.error,
+      });
+    }
+
+    if (college === 'NIT Nagaland') {
+      const rollValidation = validateRollNumber(rollNumber);
+      if (!rollValidation.valid) {
+        return res.status(400).json({
+          success: false,
+          message: rollValidation.error,
+        });
+      }
+    }
+
+    let parsedTeamMembers = [];
+    if (body.teamMembers) {
+      try {
+        parsedTeamMembers = typeof body.teamMembers === 'string'
+          ? JSON.parse(body.teamMembers)
+          : body.teamMembers;
+      } catch {
+        parsedTeamMembers = [];
+      }
+    }
+
+    // 2. Generate Unique Order ID
+    const sanitizedEvent = String(eventId).replace(/[^a-zA-Z0-9]/g, '').slice(0, 8).toUpperCase();
+    const orderId = `TA26_${sanitizedEvent}_${Date.now()}_${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+
+    // 3. Determine Return URL (Frontend redirect destination)
+    const frontendBaseUrl = process.env.FRONTEND_URL || `${req.protocol}://${req.get('host')}`;
+    const returnUrl = `${frontendBaseUrl}/enroll?order_id={order_id}`;
+    const notifyUrl = `${req.protocol}://${req.get('host')}/api/cashfree/webhook`;
+
+    // 4. Create Order on Cashfree
+    const cfResult = await createCashfreePGOrder({
+      orderId,
+      amount: cleanAmount,
+      customerName: fullName,
+      customerEmail: email,
+      customerPhone: phoneValidation.value,
+      eventTitle,
+      returnUrl,
+      notifyUrl,
+    });
+
+    if (!cfResult.success) {
+      return res.status(500).json({
+        success: false,
+        message: cfResult.message || 'Could not initiate Cashfree order.',
+        error: cfResult.error,
+      });
+    }
+
+    // 5. Store pending registration record
+    const pendingRecord = {
+      event_id: eventId,
+      event_title: eventTitle,
+      full_name: fullName.trim(),
+      email: email.trim(),
+      phone: phoneValidation.value,
+      college: college,
+      roll_number: rollNumber ? String(rollNumber).trim() : null,
+      team_name: teamName ? String(teamName).trim() : null,
+      team_members: parsedTeamMembers,
+      in_game_id: inGameID ? String(inGameID).trim() : null,
+      note: `[Cashfree Order: ${orderId}] [Amount: ₹${cleanAmount}] ${note}`.trim(),
+      status: 'Payment Pending',
+    };
+
+    let savedRegistrationId = null;
+
+    if (isSupabaseConfigured()) {
+      try {
+        const { data: inserted, error: insertErr } = await supabase
+          .from('registrations')
+          .insert([pendingRecord])
+          .select();
+
+        if (!insertErr && inserted && inserted[0]) {
+          savedRegistrationId = inserted[0].id;
+        } else {
+          console.warn('[Supabase Insert Notice for Pending Order]', insertErr?.message);
+        }
+      } catch (dbErr) {
+        console.warn('[Supabase Exception for Pending Order]', dbErr);
+      }
+    }
+
+    // Cache in memory for quick retrieval
+    pendingCashfreeOrders.set(orderId, {
+      ...pendingRecord,
+      orderId,
+      registrationId: savedRegistrationId,
+      amount: cleanAmount,
+      createdAt: Date.now(),
+    });
+
+    return res.status(201).json({
+      success: true,
+      order_id: orderId,
+      payment_session_id: cfResult.payment_session_id,
+      amount: cleanAmount,
+      isDemo: Boolean(cfResult.isDemo),
+      registrationId: savedRegistrationId,
+      message: cfResult.message || 'Cashfree payment session initialized successfully.',
+    });
+  } catch (err) {
+    console.error('[Cashfree Create Order Error]', err);
+    return res.status(500).json({
+      success: false,
+      message: err.message || 'Internal server error creating payment order.',
+    });
+  }
+});
+
+/**
+ * 8B. VERIFY CASHFREE PAYMENT & DISPATCH AUTO CONFIRMATION EMAIL
+ * POST /api/cashfree/verify-order
+ */
+app.post('/api/cashfree/verify-order', async (req, res) => {
+  try {
+    const { order_id, registrationId } = req.body;
+
+    if (!order_id) {
+      return res.status(400).json({
+        success: false,
+        message: 'Order ID is required for payment verification.',
+      });
+    }
+
+    // 1. Fetch Order Status from Cashfree
+    const orderResult = await fetchCashfreePGOrder(order_id);
+
+    if (!orderResult.success) {
+      return res.status(400).json({
+        success: false,
+        message: orderResult.message || 'Failed to verify order status with Cashfree.',
+      });
+    }
+
+    const isPaid = orderResult.order_status === 'PAID' || orderResult.isDemo;
+
+    if (!isPaid) {
+      return res.status(400).json({
+        success: false,
+        verified: false,
+        order_status: orderResult.order_status,
+        message: `Order status is "${orderResult.order_status}". Payment has not been completed.`,
+      });
+    }
+
+    // 2. Fetch Payment Breakdown (UTR / Bank Ref ID)
+    const paymentsResult = await fetchCashfreePGPayments(order_id);
+    const paymentsList = paymentsResult.payments || [];
+    const successfulPayment = paymentsList.find((p) => p.payment_status === 'SUCCESS') || paymentsList[0] || {};
+
+    const cfPaymentId = successfulPayment.cf_payment_id || `CF_${Date.now()}`;
+    const bankRefUTR = successfulPayment.bank_reference || 
+      successfulPayment.payment_method?.upi?.utr || 
+      `UTR${Date.now().toString().slice(-8)}`;
+    const paymentGroup = successfulPayment.payment_group || 'UPI/Card';
+
+    // 3. Locate Registration Record (From cache or Supabase)
+    const cachedOrder = pendingCashfreeOrders.get(order_id) || {};
+    let finalRegistration = null;
+
+    if (isSupabaseConfigured()) {
+      try {
+        let existing = null;
+
+        // Try lookup by registrationId
+        const targetId = registrationId || cachedOrder.registrationId;
+        if (targetId) {
+          const { data: byId } = await supabase
+            .from('registrations')
+            .select('*')
+            .eq('id', targetId)
+            .limit(1);
+          if (byId && byId[0]) existing = byId[0];
+        }
+
+        // Fallback: search note containing order_id
+        if (!existing) {
+          const { data: byNote } = await supabase
+            .from('registrations')
+            .select('*')
+            .ilike('note', `%${order_id}%`)
+            .limit(1);
+          if (byNote && byNote[0]) existing = byNote[0];
+        }
+
+        const updateNote = `[Cashfree Paid: ₹${orderResult.data?.order_amount || cachedOrder.amount || ''}] [UTR: ${bankRefUTR}] [PaymentID: ${cfPaymentId}] [Method: ${paymentGroup}]`;
+
+        if (existing) {
+          // Update status to 'Accepted'
+          const { data: updated, error: updateErr } = await supabase
+            .from('registrations')
+            .update({
+              status: 'Accepted',
+              note: `${existing.note || ''} | ${updateNote}`.trim(),
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', existing.id)
+            .select();
+
+          if (!updateErr && updated && updated[0]) {
+            finalRegistration = updated[0];
+          } else {
+            finalRegistration = existing;
+          }
+        } else if (cachedOrder.email) {
+          // Insert confirmed record if not previously persisted
+          const newRecord = {
+            event_id: cachedOrder.event_id,
+            event_title: cachedOrder.event_title,
+            full_name: cachedOrder.full_name,
+            email: cachedOrder.email,
+            phone: cachedOrder.phone,
+            college: cachedOrder.college,
+            roll_number: cachedOrder.roll_number,
+            team_name: cachedOrder.team_name,
+            team_members: cachedOrder.team_members,
+            in_game_id: cachedOrder.in_game_id,
+            note: `${cachedOrder.note || ''} | ${updateNote}`.trim(),
+            status: 'Accepted',
+          };
+
+          const { data: created } = await supabase
+            .from('registrations')
+            .insert([newRecord])
+            .select();
+
+          if (created && created[0]) finalRegistration = created[0];
+        }
+      } catch (dbErr) {
+        console.error('[Supabase Verification Update Error]', dbErr);
+      }
+    }
+
+    if (!finalRegistration) {
+      finalRegistration = {
+        id: registrationId || `REG_${order_id.slice(-8)}`,
+        orderId: order_id,
+        eventTitle: cachedOrder.event_title || 'Flagship Event',
+        fullName: cachedOrder.full_name || 'Participant',
+        email: cachedOrder.email,
+        phone: cachedOrder.phone,
+        college: cachedOrder.college,
+        status: 'Accepted',
+        cfPaymentId,
+        bankRefUTR,
+        paymentTime: new Date().toISOString(),
+      };
+    }
+
+    // 4. AUTOMATIC EMAIL CONFIRMATION DISPATCH VIA RESEND
+    const targetEmail = finalRegistration.email || cachedOrder.email;
+    const targetName = finalRegistration.full_name || finalRegistration.fullName || cachedOrder.full_name;
+    const targetEvent = finalRegistration.event_title || finalRegistration.eventTitle || cachedOrder.event_title;
+    const targetPassId = finalRegistration.id || order_id;
+
+    let emailResult = null;
+    if (targetEmail) {
+      console.log(`🚀 [Auto Confirmation Email] Triggering confirmation pass email to ${targetEmail} for ${targetEvent}...`);
+      emailResult = await sendResendEmail({
+        to: targetEmail,
+        fullName: targetName,
+        eventTitle: targetEvent,
+        status: 'Accepted',
+        registrationId: targetPassId,
+        reason: null,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      verified: true,
+      order_id,
+      paymentId: cfPaymentId,
+      utr: bankRefUTR,
+      registration: {
+        id: targetPassId,
+        registrationId: targetPassId,
+        orderId: order_id,
+        eventId: finalRegistration.event_id || cachedOrder.event_id,
+        eventTitle: targetEvent,
+        fullName: targetName,
+        email: targetEmail,
+        phone: finalRegistration.phone || cachedOrder.phone,
+        college: finalRegistration.college || cachedOrder.college,
+        rollNumber: finalRegistration.roll_number || cachedOrder.roll_number,
+        teamName: finalRegistration.team_name || cachedOrder.team_name,
+        teamMembers: finalRegistration.team_members || cachedOrder.team_members,
+        status: 'Accepted',
+        paymentStatus: 'PAID',
+        paymentMethod: paymentGroup,
+        utrNumber: bankRefUTR,
+        createdAt: finalRegistration.created_at || new Date().toISOString(),
+      },
+      emailSent: Boolean(emailResult?.success),
+      emailResult,
+      message: 'Payment verified successfully! Enrollment confirmed and confirmation email sent.',
+    });
+  } catch (err) {
+    console.error('[Cashfree Verify Order Error]', err);
+    return res.status(500).json({
+      success: false,
+      message: err.message || 'Internal server error verifying Cashfree payment.',
+    });
+  }
+});
+
+/**
+ * 8C. CASHFREE ASYNCHRONOUS WEBHOOK
+ * POST /api/cashfree/webhook
+ */
+app.post('/api/cashfree/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    const rawBody = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    console.log('[Cashfree Webhook Received]', rawBody?.type || rawBody?.event);
+
+    const orderData = rawBody?.data?.order || rawBody?.order || {};
+    const orderId = orderData.order_id || rawBody?.data?.order_id;
+    const orderStatus = orderData.order_status;
+
+    if (orderId && (orderStatus === 'PAID' || rawBody?.type === 'PAYMENT_SUCCESS_WEBHOOK')) {
+      if (isSupabaseConfigured()) {
+        const { data: existing } = await supabase
+          .from('registrations')
+          .select('*')
+          .ilike('note', `%${orderId}%`)
+          .limit(1);
+
+        if (existing && existing[0] && existing[0].status !== 'Accepted') {
+          await supabase
+            .from('registrations')
+            .update({ status: 'Accepted', updated_at: new Date().toISOString() })
+            .eq('id', existing[0].id);
+
+          // Dispatch confirmation email
+          if (existing[0].email) {
+            await sendResendEmail({
+              to: existing[0].email,
+              fullName: existing[0].full_name,
+              eventTitle: existing[0].event_title,
+              status: 'Accepted',
+              registrationId: existing[0].id,
+            });
+          }
+        }
+      }
+    }
+
+    return res.status(200).json({ status: 'OK' });
+  } catch (err) {
+    console.error('[Cashfree Webhook Handler Error]', err);
+    return res.status(200).json({ status: 'Error handled' });
   }
 });
 

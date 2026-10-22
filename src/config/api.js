@@ -103,4 +103,39 @@ export const uploadScreenshotDirect = async (file) => {
   });
 };
 
+// --- Cashfree Payment Gateway Operations ---
+export const createCashfreeOrder = async (orderData) => {
+  const response = await fetch(`${API_BASE_URL}/api/cashfree/create-order`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(orderData),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.message || 'Failed to initiate Cashfree order.');
+  }
+
+  return data;
+};
+
+export const verifyCashfreeOrder = async (orderId, registrationId = null) => {
+  const response = await fetch(`${API_BASE_URL}/api/cashfree/verify-order`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ order_id: orderId, registrationId }),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.message || 'Payment verification failed.');
+  }
+
+  return data;
+};
+
 export default API_BASE_URL;
